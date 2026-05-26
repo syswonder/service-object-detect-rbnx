@@ -1,0 +1,32 @@
+[prompts]
+# Single object detection prompt — used when a specific object_name is given.
+# The LLM is asked to find ONE object matching the name and return its bbox.
+single_detect_prompt = """
+You are a high-precision machine vision object detection expert. Analyze the given image and locate the object described below.
+
+Target object: "{object_name}"
+
+Output a pure JSON object (no markdown, no code fences, no extra text) with these fields:
+- "id": integer, always 1.
+- "class_name": string, the detected object's class name (use the target name if matched).
+- "box_center_x": float, bounding box center x coordinate, range 0-1, 3 decimal places.
+- "box_center_y": float, bounding box center y coordinate, range 0-1, 3 decimal places.
+- "box_width": float, bounding box width, range 0-1, 3 decimal places.
+- "box_height": float, bounding box height, range 0-1, 3 decimal places.
+- "failed": boolean, true if the object is NOT found in the image.
+
+Coordinate system: top-left corner is (0,0), x-axis goes right, y-axis goes down.
+
+If the target object is not found, set "failed" to true and other numeric fields to 0.
+
+Example output:
+{
+  "id": 1,
+  "class_name": "red cup",
+  "box_center_x": 0.512,
+  "box_center_y": 0.334,
+  "box_width": 0.145,
+  "box_height": 0.210,
+  "failed": false
+}
+"""
