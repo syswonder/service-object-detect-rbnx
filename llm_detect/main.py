@@ -185,14 +185,19 @@ def _extract_json_from_markdown(text: str) -> str:
 def _call_llm_detect(image_bgr: np.ndarray, object_name: str) -> dict:
     """Call the LLM API with the image and object name, return parsed result.
 
-    Returns dict with keys: success, class_name, box_center_x/y, box_width/height
-    (all in normalized 0-1 coords), or success=False on failure.
+    Returns dict with keys:
+      - success:       bool, true if target object was found
+      - message:       str, human-readable status
+      - target:        dict | None, the matched target object (normalized coords)
+      - other_objects: list[dict], other detected objects (normalized coords)
+    Each object dict has: class_name, box_center_x/y, box_width/height (0-1).
     """
     global _llm_client, _llm_model, _llm_temperature, _prompts, _rotation_cam2arm
 
     if _llm_client is None:
         log.error("_call_llm_detect: LLM client is None")
-        return {"success": False, "message": "LLM client not initialized"}
+        return {"success": False, "message": "LLM client not initialized",
+                "target": None, "other_objects": []}
 
     # Rotate 180 degrees if camera is mounted opposite to arm.
     import cv2
@@ -214,7 +219,8 @@ def _call_llm_detect(image_bgr: np.ndarray, object_name: str) -> dict:
     prompt_template = _prompts.get("single_detect_prompt", "")
     if not prompt_template:
         log.error("prompt template 'single_detect_prompt' not found in loaded prompts")
-        return {"success": False, "message": "prompt template 'single_detect_prompt' not found"}
+        return {"success": False, "message": "prompt template 'single_detect_prompt' not found",
+                "target": None, "other_objects": []}
     prompt = prompt_template.replace("{object_name}", object_name)
     log.info("prompt (first 200 chars): %s", prompt[:200])
 
@@ -246,20 +252,23 @@ def _call_llm_detect(image_bgr: np.ndarray, object_name: str) -> dict:
         elapsed_api = time.time() - t_api
         log.error("LLM API call FAILED after %.2fs: %s: %s",
                   elapsed_api, type(e).__name__, e)
-        return {"success": False, "message": f"LLM API call failed: {e}"}
+        return {"success": False, "message": f"LLM API call failed: {e}",
+                "target": None, "other_objects": []}
 
     elapsed_api = time.time() - t_api
     log.info("LLM API responded in %.2fs", elapsed_api)
 
     if not completion.choices:
         log.error("LLM returned no choices. completion=%s", completion)
-        return {"success": False, "message": "LLM returned no choices"}
+        return {"success": False, "message": "LLM returned no choices",
+                "target": None, "other_objects": []}
 
     content = completion.choices[0].message.content
     if not content:
         log.error("LLM returned empty content. finish_reason=%s",
                   completion.choices[0].finish_reason)
-        return {"success": False, "message": "LLM returned empty content"}
+        return {"success": False, "message": "LLM returned empty content",
+                "target": None, "other_objects": []}
 
     log.info("LLM raw response (first 500 chars): %s", content[:500])
 
@@ -269,49 +278,149 @@ def _call_llm_detect(image_bgr: np.ndarray, object_name: str) -> dict:
         result = json.loads(raw_json)
     except (json.JSONDecodeError, ValueError) as e:
         log.error("JSON parse failed: %s. Raw content: %s", e, content[:1000])
-        return {"success": False, "message": f"Failed to parse LLM response: {e}"}
+        return {"success": False, "message": f"Failed to parse LLM response: {e}",
+                "target": None, "other_objects": []}
 
-    log.info("parsed LLM result: %s", result)
+    log.info("parsed LLM result keys=%s, full=%s",
+             list(result.keys()), result)
 
-    # Check if detection failed.
-    if result.get("failed", False):
-        log.info("LLM reports object '%s' not found", object_name)
+    # Parse new schema: {target_found, target_index, objects: [...]}.
+    objects_raw = result.get("objects", [])
+    if not isinstance(objects_raw, list):
+        log.warning("'objects' field is not a list, got %s; trying legacy schema",
+                    type(objects_raw).__name__)
+        objects_raw = []
+    target_found = bool(result.get("target_found", False))
+    target_index = int(result.get("target_index", -1))
+
+    # Backward-compatibility fallback: if LLM returned the OLD single-bbox
+    # schema (top-level box_center_x + optional `failed` flag).  We trigger
+    # this whenever the top-level dict itself looks like a bbox object,
+    # regardless of whether `objects` is present (some models return a
+    # mixed/half-broken JSON).
+    has_top_level_bbox = (
+        "box_center_x" in result and "box_center_y" in result
+        and "box_width" in result and "box_height" in result
+    )
+    if has_top_level_bbox and not objects_raw:
+        log.info("detected legacy single-bbox schema (top-level bbox + empty objects), converting")
+        legacy_failed = bool(result.get("failed", False))
+        objects_raw = [{
+            "class_name":   result.get("class_name", object_name),
+            "box_center_x": result.get("box_center_x", 0.0),
+            "box_center_y": result.get("box_center_y", 0.0),
+            "box_width":    result.get("box_width", 0.0),
+            "box_height":   result.get("box_height", 0.0),
+            "is_target":    not legacy_failed,
+        }]
+        target_found = not legacy_failed
+        target_index = 0 if target_found else -1
+    elif has_top_level_bbox and objects_raw:
+        # LLM returned BOTH top-level bbox AND objects[]. Treat the top-level
+        # bbox as the target if no object in the list is marked as target.
+        any_marked = any(bool(o.get("is_target")) for o in objects_raw
+                         if isinstance(o, dict))
+        if not any_marked:
+            log.info("LLM returned top-level bbox + objects[] without is_target; "
+                     "treating top-level bbox as target")
+            legacy_failed = bool(result.get("failed", False))
+            if not legacy_failed:
+                # Prepend top-level bbox as is_target=True.
+                objects_raw = [{
+                    "class_name":   result.get("class_name", object_name),
+                    "box_center_x": result.get("box_center_x", 0.0),
+                    "box_center_y": result.get("box_center_y", 0.0),
+                    "box_width":    result.get("box_width", 0.0),
+                    "box_height":   result.get("box_height", 0.0),
+                    "is_target":    True,
+                }] + list(objects_raw)
+                target_found = True
+                target_index = 0
+
+    # Validate + normalise each object.
+    parsed_objects = []
+    for i, obj in enumerate(objects_raw):
+        try:
+            cx = float(obj["box_center_x"])
+            cy = float(obj["box_center_y"])
+            w  = float(obj["box_width"])
+            h  = float(obj["box_height"])
+        except (KeyError, TypeError, ValueError) as e:
+            log.warning("object[%d] has invalid bbox fields, skipping: %s", i, e)
+            continue
+        # Clamp to [0,1] but keep them; we still want to draw what LLM saw.
+        cx_c, cy_c = max(0.0, min(1.0, cx)), max(0.0, min(1.0, cy))
+        w_c,  h_c  = max(0.0, min(1.0, w)),  max(0.0, min(1.0, h))
+        if (cx, cy, w, h) != (cx_c, cy_c, w_c, h_c):
+            log.warning("object[%d] bbox clamped: (%.3f,%.3f,%.3f,%.3f) -> (%.3f,%.3f,%.3f,%.3f)",
+                        i, cx, cy, w, h, cx_c, cy_c, w_c, h_c)
+        # If rotation was applied, flip coordinates back.
+        if _rotation_cam2arm:
+            cx_c = 1.0 - cx_c
+            cy_c = 1.0 - cy_c
+        parsed_objects.append({
+            "class_name":   str(obj.get("class_name", "unknown")),
+            "box_center_x": cx_c,
+            "box_center_y": cy_c,
+            "box_width":    w_c,
+            "box_height":   h_c,
+            "is_target":    bool(obj.get("is_target", False)),
+        })
+
+    log.info("parsed %d objects from LLM response (target_found=%s, target_index=%d)",
+             len(parsed_objects), target_found, target_index)
+
+    # Locate target: prefer is_target flag, fall back to target_index.
+    target = None
+    target_idx_in_parsed = -1
+    for i, o in enumerate(parsed_objects):
+        if o.get("is_target"):
+            target = o
+            target_idx_in_parsed = i
+            break
+    if target is None and 0 <= target_index < len(parsed_objects):
+        target = parsed_objects[target_index]
+        target_idx_in_parsed = target_index
+        target["is_target"] = True
+    # If still not found but target_found is true and we only have 1 object,
+    # treat it as the target.
+    if target is None and target_found and len(parsed_objects) == 1:
+        target = parsed_objects[0]
+        target_idx_in_parsed = 0
+        target["is_target"] = True
+    # Last-resort heuristic: LLM did not flag any object as target, did not
+    # set target_found, but the response contains exactly one object whose
+    # class_name plausibly matches the requested object_name.  Treat it as
+    # the target so the caller is not surprised by a False success when
+    # the LLM clearly DID find the object.
+    if target is None and len(parsed_objects) == 1:
+        only = parsed_objects[0]
+        only_name = str(only.get("class_name", "")).lower()
+        wanted = object_name.lower()
+        if (wanted in only_name) or (only_name in wanted) or (wanted == only_name):
+            log.info("heuristic match: single object class_name='%s' matches target '%s'",
+                     only_name, wanted)
+            target = only
+            target_idx_in_parsed = 0
+            target["is_target"] = True
+
+    other_objects = [o for i, o in enumerate(parsed_objects)
+                     if i != target_idx_in_parsed]
+
+    if target is None:
         return {
             "success": False,
-            "message": f"object '{object_name}' not found by LLM",
+            "message": (f"object '{object_name}' not found by LLM "
+                        f"(but {len(other_objects)} other objects detected)"),
+            "target": None,
+            "other_objects": other_objects,
         }
-
-    # Validate normalized coordinates.
-    try:
-        cx = float(result["box_center_x"])
-        cy = float(result["box_center_y"])
-        w = float(result["box_width"])
-        h = float(result["box_height"])
-    except (KeyError, TypeError, ValueError) as e:
-        log.error("invalid bbox fields in LLM response: %s. result=%s", e, result)
-        return {"success": False, "message": f"Invalid bbox in LLM response: {e}"}
-
-    log.info("normalized bbox: cx=%.4f cy=%.4f w=%.4f h=%.4f", cx, cy, w, h)
-
-    if not (0.0 <= cx <= 1.0 and 0.0 <= cy <= 1.0
-            and 0.0 <= w <= 1.0 and 0.0 <= h <= 1.0):
-        log.error("bbox out of [0,1] range: cx=%.4f cy=%.4f w=%.4f h=%.4f",
-                  cx, cy, w, h)
-        return {"success": False, "message": f"LLM bbox out of range: cx={cx}, cy={cy}, w={w}, h={h}"}
-
-    # If rotation was applied, flip coordinates back.
-    if _rotation_cam2arm:
-        cx = 1.0 - cx
-        cy = 1.0 - cy
-        log.debug("flipped coords after rotation: cx=%.4f cy=%.4f", cx, cy)
 
     return {
         "success": True,
-        "class_name": result.get("class_name", object_name),
-        "box_center_x": cx,
-        "box_center_y": cy,
-        "box_width": w,
-        "box_height": h,
+        "message": "",
+        "target": target,
+        "other_objects": other_objects,
     }
 
 
@@ -354,11 +463,32 @@ def _detect_object(object_name: str) -> dict:
     log.info("LLM detection took %.2fs for '%s', success=%s",
              elapsed, object_name, llm_result.get("success", False))
 
+    target = llm_result.get("target")
+    other_objects = llm_result.get("other_objects", [])
+
+    # Helper: convert a normalised obj dict to pixel bbox.
+    def _obj_to_pixel_bbox(o):
+        cx, cy = o["box_center_x"], o["box_center_y"]
+        w,  h  = o["box_width"],    o["box_height"]
+        return [
+            int(max(0,     (cx - w / 2) * img_w)),
+            int(max(0,     (cy - h / 2) * img_h)),
+            int(min(img_w, (cx + w / 2) * img_w)),
+            int(min(img_h, (cy + h / 2) * img_h)),
+        ]
+
     if not llm_result.get("success", False):
         log.warning("detection failed for '%s': %s",
                     object_name, llm_result.get("message", "unknown"))
-        # Save the raw input image even on failure for debugging.
-        _save_detection_image(color_img, object_name, None, success=False)
+        # Save annotated image with all OTHER objects drawn (blue) so we can
+        # at least see what's in the frame.
+        _save_detection_image(color_img, object_name,
+                              target_bbox=None,
+                              other_objects=[
+                                  {**o, "bbox": _obj_to_pixel_bbox(o)}
+                                  for o in other_objects
+                              ],
+                              success=False)
         return {
             "success": False,
             "message": llm_result.get("message", "LLM detection failed"),
@@ -367,18 +497,10 @@ def _detect_object(object_name: str) -> dict:
             "confidence": 0.0,
         }
 
-    # 2. Convert normalized coords to pixel bbox [x_min, y_min, x_max, y_max].
-    cx = llm_result["box_center_x"]
-    cy = llm_result["box_center_y"]
-    w = llm_result["box_width"]
-    h = llm_result["box_height"]
-
-    x_min = int(max(0, (cx - w / 2) * img_w))
-    y_min = int(max(0, (cy - h / 2) * img_h))
-    x_max = int(min(img_w, (cx + w / 2) * img_w))
-    y_max = int(min(img_h, (cy + h / 2) * img_h))
-    bbox = [float(x_min), float(y_min), float(x_max), float(y_max)]
-    log.info("pixel bbox: [%d, %d, %d, %d]", x_min, y_min, x_max, y_max)
+    # 2. Convert target's normalized coords to pixel bbox.
+    bbox = [float(v) for v in _obj_to_pixel_bbox(target)]
+    x_min, y_min, x_max, y_max = [int(v) for v in bbox]
+    log.info("target pixel bbox: [%d, %d, %d, %d]", x_min, y_min, x_max, y_max)
 
     # 3. 3D back-projection from depth + intrinsics.
     center_3d = _back_project_3d(bbox, depth_img, cam_info)
@@ -391,10 +513,18 @@ def _detect_object(object_name: str) -> dict:
     log.info("confidence=%.3f (bbox_area=%d, img_area=%d)",
              confidence, bbox_area, img_area)
 
-    # 4. Save annotated image with bbox drawn.
-    _save_detection_image(color_img, object_name, bbox, success=True,
-                          class_name=llm_result.get("class_name", object_name),
-                          confidence=confidence)
+    # 4. Save annotated image with target (green) + other objects (blue).
+    _save_detection_image(color_img, object_name,
+                          target_bbox={
+                              "bbox": [x_min, y_min, x_max, y_max],
+                              "class_name": target.get("class_name", object_name),
+                              "confidence": confidence,
+                          },
+                          other_objects=[
+                              {**o, "bbox": _obj_to_pixel_bbox(o)}
+                              for o in other_objects
+                          ],
+                          success=True)
 
     return {
         "success":          True,
@@ -405,49 +535,77 @@ def _detect_object(object_name: str) -> dict:
     }
 
 
+def _draw_one_box(img, bbox, label, color, thickness=2):
+    """Draw one bbox + label on `img` in-place."""
+    import cv2
+    x_min, y_min, x_max, y_max = [int(v) for v in bbox]
+    cv2.rectangle(img, (x_min, y_min), (x_max, y_max), color, thickness)
+    if label:
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        # Label background above the box (or below if no room).
+        ly = max(y_min - 4, th + 4)
+        cv2.rectangle(img, (x_min, ly - th - 4),
+                      (x_min + tw + 4, ly), color, -1)
+        cv2.putText(img, label, (x_min + 2, ly - 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1,
+                    cv2.LINE_AA)
+
+
 def _save_detection_image(image_bgr: np.ndarray, object_name: str,
-                          bbox: "list | None", success: bool = True,
-                          class_name: str = "", confidence: float = 0.0):
+                          target_bbox: "dict | None" = None,
+                          other_objects: "list[dict] | None" = None,
+                          success: bool = True):
     """Save an annotated detection image to disk for debugging.
 
-    On success: draws green bbox + label.
-    On failure: saves raw image with red "FAILED" label.
-    Images are saved to ~/.llm_detect/detections/ with timestamp.
+    Always draws ALL detected objects so you can see what's in the frame:
+      - target (success):   GREEN box, label "<class> (conf)"
+      - target (failed):    none drawn (target not found)
+      - other_objects:      BLUE boxes, label "<class>"
+
+    Files use FIXED names (no timestamp) so each call overwrites:
+      - latest_ok.jpg     when target was detected successfully
+      - latest_fail.jpg   when target was NOT found
+      - latest.jpg        always (most recent regardless of outcome)
+
+    other_objects: list of dicts each containing keys:
+      - "bbox":       [x_min, y_min, x_max, y_max] in pixels
+      - "class_name": string
+    target_bbox: dict with keys "bbox", "class_name", "confidence".
     """
     try:
         import cv2
         img = image_bgr.copy()
-        timestamp_str = time.strftime("%Y%m%d_%H%M%S")
+        other_objects = other_objects or []
 
-        if success and bbox is not None:
-            x_min, y_min, x_max, y_max = [int(v) for v in bbox]
-            # Draw green bounding box.
-            cv2.rectangle(img, (x_min, y_min), (x_max, y_max),
-                          (0, 255, 0), 2)
-            # Draw label background.
-            label = f"{class_name} ({confidence:.2f})"
-            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX,
-                                          0.6, 1)
-            cv2.rectangle(img, (x_min, y_min - th - 8),
-                          (x_min + tw + 4, y_min), (0, 255, 0), -1)
-            cv2.putText(img, label, (x_min + 2, y_min - 4),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1,
-                        cv2.LINE_AA)
-            filename = f"{timestamp_str}_{object_name}_ok.jpg"
+        # 1. Draw all other objects in BLUE first (so target overlays them).
+        for o in other_objects:
+            bbox = o.get("bbox")
+            if not bbox:
+                continue
+            label = str(o.get("class_name", "?"))
+            _draw_one_box(img, bbox, label, color=(255, 128, 0), thickness=2)
+
+        # 2. Draw target on top.
+        if success and target_bbox is not None:
+            label = (f"{target_bbox.get('class_name', object_name)} "
+                     f"({target_bbox.get('confidence', 0.0):.2f})")
+            _draw_one_box(img, target_bbox["bbox"], label,
+                          color=(0, 255, 0), thickness=3)
+            filename = "latest_ok.jpg"
         else:
-            # Draw red "FAILED" text.
-            cv2.putText(img, f"FAILED: {object_name}", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2,
+            # Target not found — annotate top of image with red FAILED text.
+            msg = f"FAILED: '{object_name}' not found ({len(other_objects)} other objs)"
+            cv2.putText(img, msg, (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2,
                         cv2.LINE_AA)
-            filename = f"{timestamp_str}_{object_name}_fail.jpg"
+            filename = "latest_fail.jpg"
 
         filepath = _DETECTION_IMG_DIR / filename
         cv2.imwrite(str(filepath), img)
-        log.info("[save] annotated image saved: %s", filepath)
-
-        # Also save the latest detection as a fixed-name file for quick access.
-        latest_path = _DETECTION_IMG_DIR / "latest_detection.jpg"
-        cv2.imwrite(str(latest_path), img)
+        # Also save a generic "latest" pointer that always reflects most recent.
+        cv2.imwrite(str(_DETECTION_IMG_DIR / "latest.jpg"), img)
+        log.info("[save] annotated image saved: %s (target=%s, others=%d)",
+                 filepath, "OK" if success else "FAIL", len(other_objects))
     except Exception as e:  # noqa: BLE001
         log.warning("failed to save detection image: %s", e)
 

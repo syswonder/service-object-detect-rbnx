@@ -1,32 +1,59 @@
 [prompts]
 # Single object detection prompt — used when a specific object_name is given.
-# The LLM is asked to find ONE object matching the name and return its bbox.
+# The LLM is asked to find the target object AND list other detectable
+# objects in the scene, so we can see what's in the frame even when the
+# target is not found.
 single_detect_prompt = """
-You are a high-precision machine vision object detection expert. Analyze the given image and locate the object described below.
+You are a high-precision machine vision object detection expert. Analyze the given image and detect objects in the scene.
 
-Target object: "{object_name}"
+Primary target object: "{object_name}"
 
-Output a pure JSON object (no markdown, no code fences, no extra text) with these fields:
-- "id": integer, always 1.
-- "class_name": string, the detected object's class name (use the target name if matched).
-- "box_center_x": float, bounding box center x coordinate, range 0-1, 3 decimal places.
-- "box_center_y": float, bounding box center y coordinate, range 0-1, 3 decimal places.
-- "box_width": float, bounding box width, range 0-1, 3 decimal places.
-- "box_height": float, bounding box height, range 0-1, 3 decimal places.
-- "failed": boolean, true if the object is NOT found in the image.
+Your task:
+1. Detect the primary target object "{object_name}" if present.
+2. ALSO detect up to 5 other prominent objects visible in the image (background context). Include them even if the target object is found.
+3. Always return at least the objects you can see, even if "{object_name}" is not present.
 
-Coordinate system: top-left corner is (0,0), x-axis goes right, y-axis goes down.
-
-If the target object is not found, set "failed" to true and other numeric fields to 0.
-
-Example output:
+Output a pure JSON object (no markdown, no code fences, no extra text) with this schema:
 {
-  "id": 1,
-  "class_name": "red cup",
-  "box_center_x": 0.512,
-  "box_center_y": 0.334,
-  "box_width": 0.145,
-  "box_height": 0.210,
-  "failed": false
+  "target_found": boolean,
+  "target_index": integer,         // index into "objects" array of the target match, or -1 if not found
+  "objects": [
+    {
+      "class_name": "string",      // object name; use the target name for the matched target
+      "box_center_x": float,        // 0-1, 3 decimals
+      "box_center_y": float,        // 0-1, 3 decimals
+      "box_width":   float,        // 0-1, 3 decimals
+      "box_height":  float,        // 0-1, 3 decimals
+      "is_target":   boolean       // true ONLY for the matched target object
+    }
+  ]
+}
+
+Coordinate system: top-left corner is (0,0), x-axis goes right, y-axis goes down. All coordinates are normalized (0-1).
+
+Rules:
+- If the target object is found: set target_found=true, target_index to its index in "objects", and is_target=true on that one entry.
+- If the target object is NOT found: set target_found=false, target_index=-1, but still return all other detected objects so the caller can see what IS in the frame.
+- Always return at least one object in "objects" if the image contains any recognizable items. Only return an empty list if the image is truly empty/blank.
+
+Example (target found):
+{
+  "target_found": true,
+  "target_index": 0,
+  "objects": [
+    {"class_name": "red cup",  "box_center_x": 0.512, "box_center_y": 0.334, "box_width": 0.145, "box_height": 0.210, "is_target": true},
+    {"class_name": "keyboard", "box_center_x": 0.500, "box_center_y": 0.800, "box_width": 0.600, "box_height": 0.180, "is_target": false},
+    {"class_name": "monitor",  "box_center_x": 0.500, "box_center_y": 0.300, "box_width": 0.700, "box_height": 0.500, "is_target": false}
+  ]
+}
+
+Example (target NOT found, but other objects visible):
+{
+  "target_found": false,
+  "target_index": -1,
+  "objects": [
+    {"class_name": "keyboard", "box_center_x": 0.500, "box_center_y": 0.800, "box_width": 0.600, "box_height": 0.180, "is_target": false},
+    {"class_name": "book",     "box_center_x": 0.300, "box_center_y": 0.400, "box_width": 0.200, "box_height": 0.250, "is_target": false}
+  ]
 }
 """
