@@ -94,6 +94,12 @@ _latest_color_image = None       # numpy ndarray, BGR (from cv_bridge)
 _latest_depth_image = None       # numpy ndarray, depth in mm (uint16)
 _latest_camera_info = None       # sensor_msgs/CameraInfo
 
+# Vertical-grasp mode: when true, depth is not consumed (object_center_3d
+# is returned as []). This allows the depth subscriber to be skipped
+# entirely, saving CPU + USB bandwidth. Set via cfg.skip_depth or env
+# LLM_DETECT_SKIP_DEPTH=1.
+_skip_depth = False
+
 # LLM client (initialized in on_init).
 _llm_client: Optional[OpenAI] = None
 _llm_model: str = ""
@@ -513,19 +519,18 @@ def _detect_object(object_name: str) -> dict:
     global _latest_color_image, _latest_depth_image, _latest_camera_info
 
     with _state_lock:
-        if (_latest_color_image is None or _latest_depth_image is None
-                or _latest_camera_info is None):
+        if _latest_color_image is None or _latest_camera_info is None:
             return {
                 "success": False,
                 "message": ("camera data not available "
-                            "(waiting for synchronized RGB+depth+camera_info)"),
+                            "(waiting for RGB+camera_info)"),
                 "bbox_2d": [],
                 "object_center_3d": [],
                 "confidence": 0.0,
             }
         color_img = _latest_color_image.copy()
-        depth_img = _latest_depth_image.copy()
         cam_info = _latest_camera_info
+        depth_img = _latest_depth_image.copy() if _latest_depth_image is not None and not _skip_depth else None
 
     # 1. LLM-based detection.
     img_h, img_w = color_img.shape[:2]
@@ -582,7 +587,13 @@ def _detect_object(object_name: str) -> dict:
     log.info("target pixel bbox: [%d, %d, %d, %d]", x_min, y_min, x_max, y_max)
 
     # 3. 3D back-projection from depth + intrinsics.
-    center_3d = _back_project_3d(bbox, depth_img, cam_info)
+    #    Skipped in vertical mode (_skip_depth=True) — the downstream
+    #    yolo_grasp_rbnx does its own ray-plane intersection using TF.
+    if _skip_depth or depth_img is None:
+        center_3d = None
+        log.info("skip_depth: object_center_3d not computed (vertical mode)")
+    else:
+        center_3d = _back_project_3d(bbox, depth_img, cam_info)
     log.info("3D center: %s", center_3d)
 
     # Heuristic confidence based on bbox area ratio.
@@ -783,27 +794,52 @@ def _ros_thread_main(rgb_topic: str, depth_topic: str, info_topic: str) -> None:
         _ros_node = node
 
         # Synchronized RGB + depth + camera_info subscribers.
+        #
+        # In vertical mode (_skip_depth=True), depth is NOT subscribed —
+        # only RGB + camera_info are synchronized. This saves USB
+        # bandwidth and decouples detection from depth availability.
         sub_rgb   = message_filters.Subscriber(node, Image,      rgb_topic)
-        sub_depth = message_filters.Subscriber(node, Image,      depth_topic)
         sub_info  = message_filters.Subscriber(node, CameraInfo, info_topic)
-        sync = message_filters.ApproximateTimeSynchronizer(
-            [sub_rgb, sub_depth, sub_info], queue_size=10, slop=0.1)
 
-        def _camera_cb(rgb_msg, depth_msg, info_msg):
-            global _latest_color_image, _latest_depth_image, _latest_camera_info
-            try:
-                rgb   = _bridge.imgmsg_to_cv2(rgb_msg,   desired_encoding="passthrough")
-                depth = _bridge.imgmsg_to_cv2(depth_msg, desired_encoding="passthrough")
-            except Exception as e:  # noqa: BLE001
-                node.get_logger().error(f"camera_cb cv_bridge: {e}")
-                return
-            with _state_lock:
-                _latest_color_image = rgb
-                _latest_depth_image = depth
-                _latest_camera_info = info_msg
-        sync.registerCallback(_camera_cb)
-        log.info("subscribed: rgb=%s  depth=%s  info=%s",
-                 rgb_topic, depth_topic, info_topic)
+        if _skip_depth:
+            # RGB + camera_info only (2-way sync).
+            sync = message_filters.ApproximateTimeSynchronizer(
+                [sub_rgb, sub_info], queue_size=10, slop=0.1)
+
+            def _camera_cb(rgb_msg, info_msg):
+                global _latest_color_image, _latest_depth_image, _latest_camera_info
+                try:
+                    rgb = _bridge.imgmsg_to_cv2(rgb_msg, desired_encoding="passthrough")
+                except Exception as e:  # noqa: BLE001
+                    node.get_logger().error(f"camera_cb cv_bridge: {e}")
+                    return
+                with _state_lock:
+                    _latest_color_image = rgb
+                    _latest_depth_image = None
+                    _latest_camera_info = info_msg
+            sync.registerCallback(_camera_cb)
+            log.info("subscribed (skip_depth): rgb=%s  info=%s",
+                     rgb_topic, info_topic)
+        else:
+            sub_depth = message_filters.Subscriber(node, Image, depth_topic)
+            sync = message_filters.ApproximateTimeSynchronizer(
+                [sub_rgb, sub_depth, sub_info], queue_size=10, slop=0.1)
+
+            def _camera_cb(rgb_msg, depth_msg, info_msg):
+                global _latest_color_image, _latest_depth_image, _latest_camera_info
+                try:
+                    rgb   = _bridge.imgmsg_to_cv2(rgb_msg,   desired_encoding="passthrough")
+                    depth = _bridge.imgmsg_to_cv2(depth_msg, desired_encoding="passthrough")
+                except Exception as e:  # noqa: BLE001
+                    node.get_logger().error(f"camera_cb cv_bridge: {e}")
+                    return
+                with _state_lock:
+                    _latest_color_image = rgb
+                    _latest_depth_image = depth
+                    _latest_camera_info = info_msg
+            sync.registerCallback(_camera_cb)
+            log.info("subscribed: rgb=%s  depth=%s  info=%s",
+                     rgb_topic, depth_topic, info_topic)
 
         # Compat ROS service (pick.py, yolo_grasp.py both call this).
         def _ros_service_handler(request, response):
@@ -895,6 +931,15 @@ def init(cfg):
     _llm_model = cfg.get("llm_model", "").strip()
     _llm_temperature = float(cfg.get("temperature", 0.0))
     _rotation_cam2arm = bool(cfg.get("rotation_cam2arm", False))
+
+    # Vertical-grasp mode: skip depth subscription + back-projection.
+    # Enabled via cfg.skip_depth=true or env LLM_DETECT_SKIP_DEPTH=1.
+    global _skip_depth
+    _skip_depth = bool(cfg.get("skip_depth", False)) or \
+        os.environ.get("LLM_DETECT_SKIP_DEPTH", "").lower() in ("1", "true", "yes")
+    if _skip_depth:
+        log.info("skip_depth ENABLED — depth not subscribed, "
+                 "object_center_3d will be [] (vertical grasp mode)")
     # API request timeout in seconds. Default 30s — much shorter than
     # OpenAI SDK's default of 600s, so we don't hang indefinitely if the
     # upstream API stalls.
