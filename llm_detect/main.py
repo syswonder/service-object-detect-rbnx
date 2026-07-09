@@ -6,18 +6,13 @@ Drop-in replacement for yolo_world_rbnx. Uses an OpenAI-compatible VLM
 API (e.g. Gemini, Qwen-VL, GPT-4o) to detect objects in camera frames.
 Owns ``robonix/service/perception/object_detect/*``.
 
-Two parallel surfaces, sharing one detection function:
+Exposes one atlas-routed MCP surface:
 
-    1. Atlas-routed MCP   (the new path, what Pilot's LLM sees)
-       robonix/service/perception/object_detect/detect_object
+    robonix/service/perception/object_detect/detect_object
 
-    2. Legacy ROS service (compat path, what pick.py + yolo_grasp.py
-       still call)
-       /yolo/detect_object  (graspnet_msgs/srv/ObjectDetectionRequest)
-
-Both eventually return the highest-confidence match for the requested
-name, with 2D bbox + 3D camera-frame centroid (median depth in bbox
-back-projected through the camera_info K matrix).
+It returns the highest-confidence match for the requested name, with
+2D bbox + 3D camera-frame centroid when depth is enabled (median depth
+in bbox back-projected through the camera_info K matrix).
 
 Lifecycle:
     on_init      — parse config (LLM endpoint, model, prompts), resolve
@@ -195,7 +190,7 @@ def _call_llm_detect(image_bgr: np.ndarray, object_name: str) -> dict:
       - success:       bool, true if target object was found
       - message:       str, human-readable status
       - target:        dict | None, the matched target object (normalized coords)
-      - other_objects: list[dict], other detected objects (normalized coords)
+      - other_objects: list[dict], always empty in single-target mode
     Each object dict has: class_name, box_center_x/y, box_width/height (0-1).
     """
     global _llm_client, _llm_model, _llm_temperature, _prompts, _rotation_cam2arm
@@ -230,6 +225,35 @@ def _call_llm_detect(image_bgr: np.ndarray, object_name: str) -> dict:
     prompt = prompt_template.replace("{object_name}", object_name)
     log.info("prompt (first 200 chars): %s", prompt[:200])
 
+    detection_schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "id": {"type": "integer"},
+            "class_name": {"type": "string"},
+            "box_center_x": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+            "box_center_y": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+            "box_width": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+            "box_height": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+            "thinking_process": {
+                "anyOf": [{"type": "string"}, {"type": "null"}]
+            },
+            "failed": {
+                "anyOf": [{"type": "boolean"}, {"type": "null"}]
+            },
+        },
+        "required": [
+            "id",
+            "class_name",
+            "box_center_x",
+            "box_center_y",
+            "box_width",
+            "box_height",
+            "thinking_process",
+            "failed",
+        ],
+    }
+
     # Call LLM API.
     log.info("calling LLM API: base_url=%s, model=%s, temperature=%s",
              _llm_client.base_url, _llm_model, _llm_temperature)
@@ -252,7 +276,14 @@ def _call_llm_detect(image_bgr: np.ndarray, object_name: str) -> dict:
                 }
             ],
             temperature=_llm_temperature,
-            response_format={"type": "json_object"},
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "single_target_detection",
+                    "strict": True,
+                    "schema": detection_schema,
+                },
+            },
         )
     except Exception as e:  # noqa: BLE001
         elapsed_api = time.time() - t_api
@@ -290,220 +321,90 @@ def _call_llm_detect(image_bgr: np.ndarray, object_name: str) -> dict:
     log.info("parsed LLM result keys=%s, full=%s",
              list(result.keys()), result)
 
-    # Parse new schema: {target_found, target_index, objects: [...]}.
-    objects_raw = result.get("objects", [])
-    if not isinstance(objects_raw, list):
-        log.warning("'objects' field is not a list, got %s; trying legacy schema",
-                    type(objects_raw).__name__)
-        objects_raw = []
-    target_found = bool(result.get("target_found", False))
-    target_index = int(result.get("target_index", -1))
-
-    # Backward-compatibility fallback: if LLM returned the OLD single-bbox
-    # schema (top-level box_center_x + optional `failed` flag).  We trigger
-    # this whenever the top-level dict itself looks like a bbox object,
-    # regardless of whether `objects` is present (some models return a
-    # mixed/half-broken JSON).
-    has_top_level_bbox = (
-        "box_center_x" in result and "box_center_y" in result
-        and "box_width" in result and "box_height" in result
-    )
-    if has_top_level_bbox and not objects_raw:
-        log.info("detected legacy single-bbox schema (top-level bbox + empty objects), converting")
-        legacy_failed = bool(result.get("failed", False))
-        objects_raw = [{
-            "class_name":   result.get("class_name", object_name),
-            "box_center_x": result.get("box_center_x", 0.0),
-            "box_center_y": result.get("box_center_y", 0.0),
-            "box_width":    result.get("box_width", 0.0),
-            "box_height":   result.get("box_height", 0.0),
-            "is_target":    not legacy_failed,
-        }]
-        target_found = not legacy_failed
-        target_index = 0 if target_found else -1
-    elif has_top_level_bbox and objects_raw:
-        # LLM returned BOTH top-level bbox AND objects[]. Treat the top-level
-        # bbox as the target if no object in the list is marked as target.
-        any_marked = any(bool(o.get("is_target")) for o in objects_raw
-                         if isinstance(o, dict))
-        if not any_marked:
-            log.info("LLM returned top-level bbox + objects[] without is_target; "
-                     "treating top-level bbox as target")
-            legacy_failed = bool(result.get("failed", False))
-            if not legacy_failed:
-                # Prepend top-level bbox as is_target=True.
-                objects_raw = [{
-                    "class_name":   result.get("class_name", object_name),
-                    "box_center_x": result.get("box_center_x", 0.0),
-                    "box_center_y": result.get("box_center_y", 0.0),
-                    "box_width":    result.get("box_width", 0.0),
-                    "box_height":   result.get("box_height", 0.0),
-                    "is_target":    True,
-                }] + list(objects_raw)
-                target_found = True
-                target_index = 0
-
-    # Validate + normalise each object.
-    # If LLM returns out-of-range coords (e.g. raw pixel values like 628 instead
-    # of 0.628), the object is BAD and we drop it — clamping silently produces
-    # a bbox at the image border which is misleading.
-    parsed_objects = []
-    for i, obj in enumerate(objects_raw):
-        try:
-            cx = float(obj["box_center_x"])
-            cy = float(obj["box_center_y"])
-            w  = float(obj["box_width"])
-            h  = float(obj["box_height"])
-        except (KeyError, TypeError, ValueError) as e:
-            log.warning("object[%d] has invalid bbox fields, skipping: %s (raw=%s)",
-                        i, e, obj)
-            continue
-        # Read fuzzy-match score (added by new prompt). Tolerate missing/bad value.
-        try:
-            tms = float(obj.get("target_match_score", 0.0))
-        except (TypeError, ValueError):
-            tms = 0.0
-        tms = max(0.0, min(1.0, tms))
-        # Detect out-of-[0,1] coords (LLM occasionally outputs raw pixels) and
-        # drop the object — clamping a value like 628 to 1.0 would silently
-        # place the bbox at the image edge.
-        oob = [v for v in (cx, cy, w, h) if not (0.0 <= v <= 1.0)]
-        if oob:
-            log.warning("object[%d] has out-of-range coords (cx=%.3f cy=%.3f w=%.3f h=%.3f); "
-                        "dropping (LLM likely returned raw pixels). class_name='%s'",
-                        i, cx, cy, w, h, obj.get("class_name", "?"))
-            continue
-        # Drop near-zero size boxes too.
-        if w <= 1e-3 or h <= 1e-3:
-            log.warning("object[%d] has degenerate size w=%.4f h=%.4f; dropping. class_name='%s'",
-                        i, w, h, obj.get("class_name", "?"))
-            continue
-        cx_c, cy_c, w_c, h_c = cx, cy, w, h
-        # If rotation was applied, flip coordinates back.
-        if _rotation_cam2arm:
-            cx_c = 1.0 - cx_c
-            cy_c = 1.0 - cy_c
-        parsed_objects.append({
-            "class_name":         str(obj.get("class_name", "unknown")),
-            "box_center_x":       cx_c,
-            "box_center_y":       cy_c,
-            "box_width":          w_c,
-            "box_height":         h_c,
-            "is_target":          bool(obj.get("is_target", False)),
-            "target_match_score": tms,
-        })
-
-    log.info("parsed %d objects from LLM response (target_found=%s, target_index=%d)",
-             len(parsed_objects), target_found, target_index)
-    for i, o in enumerate(parsed_objects):
-        log.info("  obj[%d] class='%s' is_target=%s target_match_score=%.2f bbox=(%.3f,%.3f,%.3f,%.3f)",
-                 i, o["class_name"], o["is_target"], o["target_match_score"],
-                 o["box_center_x"], o["box_center_y"], o["box_width"], o["box_height"])
-
-    # ── Locate target ───────────────────────────────────────────────────
-    # Strategy:
-    #   (1) Strict match: any object with is_target=true.
-    #   (2) target_index pointer (if valid).
-    #   (3) target_found + single object.
-    #   (4) Heuristic substring match on class_name (single-object case).
-    #   (5) Fuzzy match: highest target_match_score above FUZZY_THRESHOLD.
-    # Steps (1)-(4) yield a STRICT match (fuzzy_matched=False).
-    # Step (5) yields a FUZZY match (fuzzy_matched=True) and is logged loudly.
-    FUZZY_THRESHOLD = 0.60   # minimum score for fuzzy fallback acceptance
-
-    target = None
-    target_idx_in_parsed = -1
-    fuzzy_matched = False
-    match_reason = ""
-
-    # (1) is_target flag.
-    for i, o in enumerate(parsed_objects):
-        if o.get("is_target"):
-            target = o
-            target_idx_in_parsed = i
-            match_reason = "strict: is_target=true"
-            break
-    # (2) target_index pointer.
-    if target is None and 0 <= target_index < len(parsed_objects):
-        target = parsed_objects[target_index]
-        target_idx_in_parsed = target_index
-        target["is_target"] = True
-        match_reason = f"strict: target_index={target_index}"
-    # (3) target_found + single object.
-    if target is None and target_found and len(parsed_objects) == 1:
-        target = parsed_objects[0]
-        target_idx_in_parsed = 0
-        target["is_target"] = True
-        match_reason = "strict: target_found=true with single object"
-    # (4) Heuristic substring match on class_name (single-object case).
-    if target is None and len(parsed_objects) == 1:
-        only = parsed_objects[0]
-        only_name = str(only.get("class_name", "")).lower()
-        wanted = object_name.lower()
-        if (wanted in only_name) or (only_name in wanted) or (wanted == only_name):
-            target = only
-            target_idx_in_parsed = 0
-            target["is_target"] = True
-            match_reason = (f"strict heuristic: single object class_name='{only_name}' "
-                            f"matches '{wanted}'")
-
-    # (5) Fuzzy match via target_match_score.
-    if target is None and parsed_objects:
-        # Sort candidates by score desc.
-        scored = sorted(
-            enumerate(parsed_objects),
-            key=lambda kv: kv[1].get("target_match_score", 0.0),
-            reverse=True,
-        )
-        log.info("[fuzzy] no strict target; candidates (sorted by score) for target='%s':",
-                 object_name)
-        for idx, o in scored:
-            log.info("  cand[%d] class='%s' score=%.2f",
-                     idx, o["class_name"], o.get("target_match_score", 0.0))
-        best_idx, best_obj = scored[0]
-        best_score = best_obj.get("target_match_score", 0.0)
-        if best_score >= FUZZY_THRESHOLD:
-            target = best_obj
-            target_idx_in_parsed = best_idx
-            target["is_target"] = True
-            fuzzy_matched = True
-            match_reason = (f"FUZZY: best score {best_score:.2f} >= threshold "
-                            f"{FUZZY_THRESHOLD:.2f}; class_name='{best_obj['class_name']}'")
-            log.info("[fuzzy] ACCEPTED: target='%s' -> '%s' (score=%.2f, threshold=%.2f)",
-                     object_name, best_obj["class_name"], best_score, FUZZY_THRESHOLD)
-        else:
-            log.info("[fuzzy] REJECTED: best candidate '%s' score=%.2f < threshold %.2f",
-                     best_obj["class_name"], best_score, FUZZY_THRESHOLD)
-
-    other_objects = [o for i, o in enumerate(parsed_objects)
-                     if i != target_idx_in_parsed]
-
-    if target is None:
+    if bool(result.get("failed", False)):
         return {
-            "success":        False,
-            "message":        (f"object '{object_name}' not found by LLM "
-                                f"(but {len(other_objects)} other objects detected)"),
-            "target":         None,
-            "other_objects":  other_objects,
-            "fuzzy_matched":  False,
-            "match_reason":   "no target found",
+            "success": False,
+            "message": f"object '{object_name}' not found by LLM",
+            "target": None,
+            "other_objects": [],
+            "fuzzy_matched": False,
+            "match_reason": "single-target failed=true",
         }
 
-    log.info("target locked: class='%s' score=%.2f reason=%s",
-             target["class_name"], target.get("target_match_score", 0.0),
-             match_reason)
+    try:
+        cx = float(result["box_center_x"])
+        cy = float(result["box_center_y"])
+        w = float(result["box_width"])
+        h = float(result["box_height"])
+    except (KeyError, TypeError, ValueError) as e:
+        log.warning("single-target response has invalid bbox fields: %s raw=%s",
+                    e, result)
+        return {
+            "success": False,
+            "message": f"LLM returned invalid bbox fields for '{object_name}': {e}",
+            "target": None,
+            "other_objects": [],
+            "fuzzy_matched": False,
+            "match_reason": "invalid bbox fields",
+        }
+
+    bad_values = [v for v in (cx, cy, w, h) if not (0.0 <= v <= 1.0)]
+    if bad_values:
+        msg = (
+            f"LLM returned non-normalized bbox for '{object_name}': "
+            f"cx={cx:.3f}, cy={cy:.3f}, w={w:.3f}, h={h:.3f}"
+        )
+        log.warning("%s", msg)
+        return {
+            "success": False,
+            "message": msg,
+            "target": None,
+            "other_objects": [],
+            "fuzzy_matched": False,
+            "match_reason": "non-normalized bbox",
+        }
+    if w <= 1e-3 or h <= 1e-3:
+        msg = (
+            f"LLM returned degenerate bbox for '{object_name}': "
+            f"w={w:.4f}, h={h:.4f}"
+        )
+        log.warning("%s", msg)
+        return {
+            "success": False,
+            "message": msg,
+            "target": None,
+            "other_objects": [],
+            "fuzzy_matched": False,
+            "match_reason": "degenerate bbox",
+        }
+
+    if _rotation_cam2arm:
+        cx = 1.0 - cx
+        cy = 1.0 - cy
+
+    target = {
+        "class_name": str(result.get("class_name", object_name)),
+        "box_center_x": cx,
+        "box_center_y": cy,
+        "box_width": w,
+        "box_height": h,
+        "target_match_score": 1.0,
+    }
+
+    log.info("target locked: class='%s' reason=single-target schema",
+             target["class_name"])
 
     return {
         "success":        True,
         "message":        "",
         "target":         target,
-        "other_objects":  other_objects,
-        "fuzzy_matched":  fuzzy_matched,
-        "match_reason":   match_reason,
+        "other_objects":  [],
+        "fuzzy_matched":  False,
+        "match_reason":   "single-target schema",
     }
 
 
-# ── detection core (shared between MCP + ROS service) ───────────────────────
+# ── detection core ──────────────────────────────────────────────────────────
 def _detect_object(object_name: str) -> dict:
     """Detection core. Returns a dict with the same keys both surfaces fill.
 
@@ -771,9 +672,7 @@ def _back_project_3d(bbox_2d, depth_img, cam_info):
 
 # ── ROS bring-up (background thread) ────────────────────────────────────────
 def _ros_thread_main(rgb_topic: str, depth_topic: str, info_topic: str) -> None:
-    """Subscribe + ROS service host + topic publishers, all in one rclpy
-    node. Stays alive for the lifetime of the package.
-    """
+    """Subscribe to camera topics in one rclpy node."""
     global _ros_node, _bridge
     global _latest_color_image, _latest_depth_image, _latest_camera_info
     global _ros_thread_error
@@ -785,9 +684,6 @@ def _ros_thread_main(rgb_topic: str, depth_topic: str, info_topic: str) -> None:
         from sensor_msgs.msg import Image, CameraInfo  # noqa: E402
         from cv_bridge import CvBridge            # noqa: E402
         import message_filters                    # noqa: E402
-        from graspnet_msgs.srv import ObjectDetectionRequest  # noqa: E402
-        from graspnet_msgs.msg import DetectedObject, DetectedObjects  # noqa: E402
-
         rclpy.init(args=None)
         _bridge = CvBridge()
         node = Node("llm_detect_node")
@@ -841,26 +737,6 @@ def _ros_thread_main(rgb_topic: str, depth_topic: str, info_topic: str) -> None:
             log.info("subscribed: rgb=%s  depth=%s  info=%s",
                      rgb_topic, depth_topic, info_topic)
 
-        # Compat ROS service (pick.py, yolo_grasp.py both call this).
-        def _ros_service_handler(request, response):
-            result = _detect_object(request.object_name)
-            response.success           = result["success"]
-            response.message           = result["message"]
-            response.bbox_2d           = list(result["bbox_2d"])
-            response.object_center_3d  = list(result["object_center_3d"])
-            response.confidence        = float(result["confidence"])
-            return response
-        node.create_service(ObjectDetectionRequest, "/yolo/detect_object",
-                            _ros_service_handler)
-        log.info("ROS service up: /yolo/detect_object")
-
-        # Compat publishers (kept for subscribers like visualization tools).
-        detection_image_pub = node.create_publisher(Image, "/yolo/detection_image", 10)
-        detected_objects_pub = node.create_publisher(
-            DetectedObjects, "/yolo/detect_objects", 10)
-        globals()["_detection_image_pub"]  = detection_image_pub
-        globals()["_detected_objects_pub"] = detected_objects_pub
-
     except BaseException as e:  # noqa: BLE001
         _ros_thread_error = e
         log.error("rclpy thread setup failed: %s: %s",
@@ -907,7 +783,7 @@ def init(cfg):
       1. parse cfg + initialize LLM client
       2. load prompts from config/prompts.toml
       3. resolve atlas camera contracts → topic names
-      4. spawn rclpy thread (subscribers + service + publishers)
+      4. spawn rclpy thread (camera subscribers only)
     """
     global _initialized, _llm_client, _llm_model, _llm_temperature
     global _prompts, _rotation_cam2arm
@@ -1014,7 +890,7 @@ def init(cfg):
 
     with _state_lock:
         _initialized = True
-    log.info("init complete: object_detect MCP + /yolo/detect_object live")
+    log.info("init complete: object_detect MCP live")
     return Ok()
 
 

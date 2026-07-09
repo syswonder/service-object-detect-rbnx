@@ -8,10 +8,8 @@
 # back-projection uses the median depth value inside the 2D bbox and
 # the camera_info K matrix (same algorithm as yolo_world_rbnx).
 #
-# IDL: lib/perception/srv/DetectObject.srv (package-local). The schema is
-# bytes-identical to upstream graspnet_msgs/srv/ObjectDetectionRequest.srv
-# (which yolo_grasp_rbnx still calls via ROS), just renamed for the robonix
-# namespace. Both paths share the same detection function.
+# IDL: lib/perception/srv/DetectObject.srv (package-local), exposed only
+# through the atlas-routed MCP surface.
 [contract]
 id      = "robonix/service/perception/object_detect/detect_object"
 version = "1"

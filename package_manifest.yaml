@@ -4,11 +4,8 @@
 # object detection approach. Uses OpenAI-compatible vision API to detect
 # objects in camera frames. Owns `robonix/service/perception/object_detect/*`.
 #
-# Two-surface design (same contract as yolo_world_rbnx):
-#   * NEW   atlas-routed MCP    object_detect/detect_object  (Pilot's view)
-#   * OLD   ROS service         /yolo/detect_object          (pick.py + yolo_grasp.py)
-#   Both share one detection function; killing the ROS path is a
-#   Stage 6 cutover (when pick_skill_rbnx switches to atlas).
+# Surface:
+#   * atlas-routed MCP    object_detect/detect_object  (Pilot / pick_skill view)
 #
 # Lifecycle:
 #   on_init      — parse config (LLM endpoint, model, prompts), resolve
@@ -32,15 +29,13 @@
 #                        /camera/color/camera_info
 #   rotation_cam2arm     Whether camera is mounted opposite to arm (default false)
 #
-# Vendored:
-#   src/graspnet_msgs/   (msg + srv) — colcon build for ROS bindings
 manifestVersion: 1
 
 package:
   name: com.robonix.piper_grasp.llm_detect
   version: 0.1.0
   vendor: robonix
-  description: LLM-based object detection — atlas + ROS dual surface, drop-in replacement for yolo_world_rbnx.
+  description: LLM-based object detection — atlas MCP service, drop-in replacement for yolo_world_rbnx.
   license: MulanPSL-2.0
 
 capability_id: llm_detect
