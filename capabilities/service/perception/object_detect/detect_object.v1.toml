@@ -18,6 +18,3 @@ idl     = "perception/srv/DetectObject.srv"
 
 [mode]
 type = "rpc"
-
-[semantics]
-user_invocable = true
