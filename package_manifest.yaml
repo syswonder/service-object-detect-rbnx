@@ -42,6 +42,8 @@ package:
   vendor: robonix
   description: LLM-based object detection — atlas + ROS dual surface, drop-in replacement for yolo_world_rbnx.
   license: MulanPSL-2.0
+  tags: [service, perception, object_detect, llm, vlm, ros2]
+  maintainers: ["lhw2002426 <lhw2002426@users.noreply.github.com>"]
 
 capability_id: llm_detect
 
