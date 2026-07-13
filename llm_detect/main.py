@@ -135,7 +135,8 @@ def _resolve_topic(key: str, cfg: dict) -> str:
 
     Priority:
       1. cfg[f'{key}_topic'] — explicit override
-      2. atlas find_capability(<contract>, transport=ros2) → endpoint
+      2. atlas find_capability(<contract>, transport=ros2, provider_id=...)
+         → endpoint
       3. _DEFAULT_TOPICS[key]
     """
     explicit = (cfg.get(f"{key}_topic") or "").strip()
@@ -144,8 +145,13 @@ def _resolve_topic(key: str, cfg: dict) -> str:
         return explicit
 
     contract_id = _DEP_CONTRACTS[key]
+    provider_id = str(cfg.get("camera_provider_id") or "").strip()
     try:
-        caps = ATLAS.find_capability(contract_id=contract_id, transport="ros2")
+        caps = ATLAS.find_capability(
+            contract_id=contract_id,
+            transport="ros2",
+            provider_id=provider_id,
+        )
     except Exception as e:  # noqa: BLE001
         log.warning("atlas query %s failed: %s — falling back to default",
                     contract_id, e)
@@ -167,7 +173,13 @@ def _resolve_topic(key: str, cfg: dict) -> str:
             log.warning("atlas connect %s failed: %s", contract_id, e)
 
     fallback = _DEFAULT_TOPICS[key]
-    log.warning("topic[%s] no atlas provider; using default %s", key, fallback)
+    if provider_id:
+        log.warning(
+            "topic[%s] no atlas provider %s for %s; using default %s",
+            key, provider_id, contract_id, fallback,
+        )
+    else:
+        log.warning("topic[%s] no atlas provider; using default %s", key, fallback)
     return fallback
 
 
@@ -856,8 +868,12 @@ def init(cfg):
 
     # 3. Resolve atlas camera contracts.
     rgb_topic   = _resolve_topic("rgb",         cfg)
-    depth_topic = _resolve_topic("depth",       cfg)
     info_topic  = _resolve_topic("camera_info", cfg)
+    if _skip_depth:
+        depth_topic = _DEFAULT_TOPICS["depth"]
+        log.info("skip_depth: depth topic resolution skipped")
+    else:
+        depth_topic = _resolve_topic("depth", cfg)
 
     # 4. Spawn rclpy thread.
     global _ros_thread, _ros_thread_error
