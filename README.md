@@ -1,6 +1,6 @@
 # service-object-detect-rbnx
 
-Robonix package for **LLM/VLM-based object detection**. Atlas + ROS dual surface, drop-in replacement for the older `yolo_world_rbnx`. Owns the `service/perception/object_detect/*` namespace.
+Robonix package for **LLM/VLM-based object detection**. It exposes an atlas-routed MCP service and replaces the older `yolo_world_rbnx` path. Owns the `service/perception/object_detect/*` namespace.
 
 Catalog name: `robonix.service.object_detect`.
 
@@ -9,15 +9,15 @@ Catalog name: `robonix.service.object_detect`.
 | Contract                                                  | Mode | Transport | Source / handler                                          |
 | --------------------------------------------------------- | ---- | --------- | --------------------------------------------------------- |
 | `robonix/service/perception/object_detect/driver`         | rpc  | gRPC      | `Driver(CMD_INIT, config_json)` — lifecycle gate          |
-| `robonix/service/perception/object_detect/detect_object`  | rpc  | gRPC/MCP  | `DetectObject(object_name) → bbox_2d + object_center_3d`  |
+| `robonix/service/perception/object_detect/detect_object`  | rpc  | MCP       | `DetectObject(object_name) → bbox_2d + object_center_3d`  |
 
-The legacy ROS service `/yolo/detect_object` is kept alive as a secondary surface for legacy consumers; the atlas-routed MCP form is the LLM-facing surface.
+There is no legacy `/yolo/detect_object` ROS-service fallback in this package.
 
 ## Compared with the old `yolo_world` path
 
 - no GPU / ultralytics weights;
 - RGB → OpenAI-compatible VLM → 2D bbox;
-- in vertical-grasp mode the depth stream is completely unused (`skip_depth=true`); the grasp point is recovered by `service-grasp-pose-rbnx` from a fixed tabletop z plus camera-ray back-projection.
+- in vertical-grasp mode the depth stream is completely unused (`skip_depth=true`); `service-grasp-pose-rbnx` maps the bbox center through the calibrated 2D homography and combines it with the configured tabletop z.
 
 ## Boot ordering
 
@@ -55,7 +55,7 @@ service-object-detect-rbnx/
   "llm_base_url":       "https://api.ofox.ai/v1",
   "llm_api_key":        "sk-...",
   "llm_model":          "google/gemini-3.1-flash-lite",
-  "temperature":        0.7,
+  "temperature":        0.0,
   "rotation_cam2arm":   true,
   "skip_depth":         true,
   "rgb_topic":          "",
@@ -85,9 +85,7 @@ rbnx caps | grep object_detect
 # End-to-end via the atlas MCP surface:
 rbnx ask "where is the paper on the desk?"
 
-# Legacy ROS surface (for backwards compatibility):
-ros2 service call /yolo/detect_object <detect_srv_type> \
-    "{object_name: 'paper'}"
+# The package intentionally has no direct ROS service surface.
 ```
 
 ## License
