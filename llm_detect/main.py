@@ -157,7 +157,36 @@ def _resolve_topic(key: str, cfg: dict) -> str:
                     contract_id, e)
         caps = []
 
+    # Log every candidate atlas returned so multi-camera setups are debuggable.
+    # `provider_id` is the only knob object_detect has for picking one — if you
+    # see multiple lines here and the wrong one gets chosen, set
+    # `camera_provider_id` in the deploy manifest to the desired provider.
     if caps:
+        log.info(
+            "topic[%s] atlas returned %d candidate(s) for %s "
+            "(transport=ros2, provider_id_filter=%r):",
+            key, len(caps), contract_id, provider_id or "<any>",
+        )
+        for i, c in enumerate(caps):
+            try:
+                kind_name = getattr(c.provider_kind, "name", str(c.provider_kind))
+                transport_name = getattr(c.transport, "name", str(c.transport))
+            except Exception:  # noqa: BLE001
+                kind_name = str(getattr(c, "provider_kind", "?"))
+                transport_name = str(getattr(c, "transport", "?"))
+            log.info(
+                "  [%d]%s provider_id=%s kind=%s transport=%s contract=%s "
+                "ns_mismatch=%s desc=%r",
+                i,
+                " <- SELECTED" if i == 0 else "",
+                c.provider_id,
+                kind_name,
+                transport_name,
+                c.contract_id,
+                getattr(c, "namespace_mismatch", False),
+                getattr(c, "description", "") or "",
+            )
+
         try:
             ch = llm_detect.connect_capability(caps[0], contract_id, "ros2")
             ep = ch.endpoint
