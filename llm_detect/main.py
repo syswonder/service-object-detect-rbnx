@@ -212,6 +212,118 @@ def _resolve_topic(key: str, cfg: dict) -> str:
     return fallback
 
 
+# ── orientation helpers ─────────────────────────────────────────────────────
+# Coarse 4-way orientation labels the LLM is asked to pick from, plus an
+# explicit "unknown" bucket for round/symmetric objects. Kept as a module
+# constant so both the JSON schema and the drawing helper stay in sync.
+ORIENTATION_LABELS = (
+    "vertical",    # long axis is roughly up-down     ( | )
+    "horizontal",  # long axis is roughly left-right  ( -- )
+    "diag_tlbr",   # top-left  -> bottom-right        ( \ )
+    "diag_trbl",   # top-right -> bottom-left         ( / )
+    "unknown",     # round / symmetric / not confident
+)
+
+# Magenta BGR — deliberately different from target (green/yellow) and
+# other_objects (orange) so the orientation stroke pops on the debug image.
+_ORIENTATION_COLOR = (255, 0, 255)
+
+
+def _normalize_orientation(raw: Any) -> str:
+    """Coerce an LLM-returned orientation value to one of ORIENTATION_LABELS.
+
+    Anything unrecognized (None, empty, misspelled, some free-form phrase)
+    is folded to "unknown" so downstream drawing/consumers never crash.
+    """
+    if not isinstance(raw, str):
+        return "unknown"
+    v = raw.strip().lower().replace("-", "_").replace(" ", "_")
+    # Common alias folding — keep this permissive so the model can drift a
+    # little without us returning "unknown" and losing the direction line.
+    aliases = {
+        "up_down": "vertical",
+        "updown": "vertical",
+        "portrait": "vertical",
+        "left_right": "horizontal",
+        "leftright": "horizontal",
+        "landscape": "horizontal",
+        "tl_br": "diag_tlbr",
+        "tlbr": "diag_tlbr",
+        "top_left_bottom_right": "diag_tlbr",
+        "backslash": "diag_tlbr",
+        "\\": "diag_tlbr",
+        "tr_bl": "diag_trbl",
+        "trbl": "diag_trbl",
+        "top_right_bottom_left": "diag_trbl",
+        "slash": "diag_trbl",
+        "/": "diag_trbl",
+        "none": "unknown",
+        "": "unknown",
+    }
+    v = aliases.get(v, v)
+    if v not in ORIENTATION_LABELS:
+        return "unknown"
+    return v
+
+
+def _flip_orientation_180(o: str) -> str:
+    """When the input image is rotated 180°, the reported orientation is
+    still valid for an axis (unsigned direction), but for consistency we
+    keep the mapping explicit. vertical/horizontal stay put; the two
+    diagonals also stay put under a 180° rotation (they map to themselves)."""
+    # A 180° rotation flips vectors by sign but leaves *axes* unchanged, so
+    # all four directional labels are invariant. Function kept for clarity
+    # in case we ever quantize to 8 directions.
+    return o
+
+
+def _orientation_endpoints(bbox, orientation: str):
+    """Compute the two endpoints of an orientation stroke inside `bbox`.
+
+    bbox: (x_min, y_min, x_max, y_max) in pixels.
+    Returns (pt1, pt2) as int tuples, or None if orientation has no line
+    (i.e. "unknown"). Endpoints are inset slightly from the bbox edge so
+    the stroke stays visually inside the rectangle.
+    """
+    x_min, y_min, x_max, y_max = [int(v) for v in bbox]
+    if x_max <= x_min or y_max <= y_min:
+        return None
+    cx = (x_min + x_max) // 2
+    cy = (y_min + y_max) // 2
+    # Inset by 8% of the shorter side so the stroke doesn't overlap the
+    # bbox border and lose contrast.
+    inset = max(2, int(0.08 * min(x_max - x_min, y_max - y_min)))
+    x0, x1 = x_min + inset, x_max - inset
+    y0, y1 = y_min + inset, y_max - inset
+
+    if orientation == "vertical":
+        return (cx, y0), (cx, y1)
+    if orientation == "horizontal":
+        return (x0, cy), (x1, cy)
+    if orientation == "diag_tlbr":
+        return (x0, y0), (x1, y1)
+    if orientation == "diag_trbl":
+        return (x1, y0), (x0, y1)
+    # "unknown" or anything else → no stroke.
+    return None
+
+
+def _draw_orientation(img, bbox, orientation: str,
+                      color=_ORIENTATION_COLOR, thickness: int = 3) -> bool:
+    """Overlay a coarse orientation stroke on `img` in-place.
+
+    Returns True if a stroke was drawn, False otherwise (e.g. "unknown"
+    or degenerate bbox).
+    """
+    import cv2
+    endpoints = _orientation_endpoints(bbox, orientation)
+    if endpoints is None:
+        return False
+    pt1, pt2 = endpoints
+    cv2.line(img, pt1, pt2, color, thickness, cv2.LINE_AA)
+    return True
+
+
 # ── LLM detection helpers ───────────────────────────────────────────────────
 def _extract_json_from_markdown(text: str) -> str:
     """Extract JSON content from possible markdown code fences."""
@@ -276,6 +388,10 @@ def _call_llm_detect(image_bgr: np.ndarray, object_name: str) -> dict:
             "box_center_y": {"type": "number", "minimum": 0.0, "maximum": 1.0},
             "box_width": {"type": "number", "minimum": 0.0, "maximum": 1.0},
             "box_height": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+            "orientation": {
+                "type": "string",
+                "enum": ORIENTATION_LABELS,
+            },
             "thinking_process": {
                 "anyOf": [{"type": "string"}, {"type": "null"}]
             },
@@ -290,6 +406,7 @@ def _call_llm_detect(image_bgr: np.ndarray, object_name: str) -> dict:
             "box_center_y",
             "box_width",
             "box_height",
+            "orientation",
             "thinking_process",
             "failed",
         ],
@@ -419,9 +536,11 @@ def _call_llm_detect(image_bgr: np.ndarray, object_name: str) -> dict:
             "match_reason": "degenerate bbox",
         }
 
+    orientation = _normalize_orientation(result.get("orientation"))
     if _rotation_cam2arm:
         cx = 1.0 - cx
         cy = 1.0 - cy
+        orientation = _flip_orientation_180(orientation)
 
     target = {
         "class_name": str(result.get("class_name", object_name)),
@@ -429,8 +548,11 @@ def _call_llm_detect(image_bgr: np.ndarray, object_name: str) -> dict:
         "box_center_y": cy,
         "box_width": w,
         "box_height": h,
+        "orientation": orientation,
         "target_match_score": 1.0,
     }
+    log.info("orientation: raw=%r normalized=%r",
+             result.get("orientation"), orientation)
 
     log.info("target locked: class='%s' reason=single-target schema",
              target["class_name"])
@@ -545,14 +667,16 @@ def _detect_object(object_name: str) -> dict:
     log.info("confidence=%.3f (bbox_area=%d, img_area=%d)",
              confidence, bbox_area, img_area)
 
-    # 4. Save annotated image with target (green/yellow) + other objects (blue).
+    # 4. Save annotated image with target (green/yellow) + other objects (blue) +
+    #    orientation stroke (magenta).
     target_class = target.get("class_name", object_name)
     target_score = float(target.get("target_match_score", 0.0))
+    orientation = target.get("orientation", "unknown")
     if fuzzy_matched:
         target_label = (f"{target_class} [FUZZY {target_score:.2f}] "
-                        f"req='{object_name}' ({confidence:.2f})")
+                        f"req='{object_name}' ({confidence:.2f}) dir={orientation}")
     else:
-        target_label = f"{target_class} ({confidence:.2f})"
+        target_label = f"{target_class} ({confidence:.2f}) dir={orientation}"
     _save_detection_image(color_img, object_name,
                           target_bbox={
                               "bbox": [x_min, y_min, x_max, y_max],
@@ -560,6 +684,7 @@ def _detect_object(object_name: str) -> dict:
                               "confidence": confidence,
                               "label": target_label,
                               "fuzzy": fuzzy_matched,
+                              "orientation": orientation,
                           },
                           other_objects=[
                               {**o, "bbox": _obj_to_pixel_bbox(o)}
@@ -579,6 +704,7 @@ def _detect_object(object_name: str) -> dict:
         "bbox_2d":          bbox,
         "object_center_3d": center_3d if center_3d is not None else [],
         "confidence":       float(confidence),
+        "orientation":      orientation,
     }
 
 
@@ -620,7 +746,10 @@ def _save_detection_image(image_bgr: np.ndarray, object_name: str,
       - "class_name":         string
       - "target_match_score": float (optional, drawn into label if present)
     target_bbox: dict with keys "bbox", "class_name", "confidence", and
-      optional "label" (overrides default) and "fuzzy" (bool).
+      optional "label" (overrides default), "fuzzy" (bool), and
+      "orientation" (one of ORIENTATION_LABELS). When "orientation" is
+      provided (and is not "unknown"), a magenta stroke is drawn inside
+      the bbox to visualize the coarse principal-axis direction.
     """
     try:
         import cv2
@@ -650,6 +779,11 @@ def _save_detection_image(image_bgr: np.ndarray, object_name: str,
             )
             _draw_one_box(img, target_bbox["bbox"], label,
                           color=target_color, thickness=3)
+            # Orientation stroke — magenta line INSIDE the bbox showing the
+            # coarse principal-axis direction reported by the LLM. Drawn
+            # after the box so it stays visible over the border.
+            orientation = target_bbox.get("orientation", "unknown")
+            _draw_orientation(img, target_bbox["bbox"], orientation)
             # Overlay banner at top so the user immediately knows it was fuzzy.
             if is_fuzzy:
                 cv2.putText(img, f"FUZZY MATCH: req='{object_name}'",
@@ -962,10 +1096,14 @@ from perception_mcp import (  # noqa: E402  pylint: disable=wrong-import-positio
 def detect_object(req: DetectObject_Request) -> DetectObject_Response:
     """Detect a named object using LLM vision."""
     result = _detect_object(req.object_name)
+    # `orientation` is only populated on the success path of _detect_object;
+    # on every failure path we fall back to "unknown" so downstream callers
+    # (grasp_pose) can always assume a well-formed string.
     return DetectObject_Response(
         bbox_2d          = list(result["bbox_2d"]),
         object_center_3d = list(result["object_center_3d"]),
         confidence       = float(result["confidence"]),
+        orientation      = str(result.get("orientation", "unknown")),
         success          = bool(result["success"]),
         message          = str(result["message"]),
     )

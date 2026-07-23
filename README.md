@@ -88,6 +88,63 @@ rbnx ask "where is the paper on the desk?"
 # The package intentionally has no direct ROS service surface.
 ```
 
+## Orientation output (branch `feature/orientation-detection`)
+
+In addition to the tight bounding box, the LLM is now asked to also
+return a **coarse 4-way orientation** for the primary target, using the
+object's principal / long axis:
+
+| label        | meaning                                                | stroke |
+| ------------ | ------------------------------------------------------ | ------ |
+| `vertical`   | long axis is roughly up-down                           | `|`    |
+| `horizontal` | long axis is roughly left-right                        | `--`   |
+| `diag_tlbr`  | top-left → bottom-right                                | `\`    |
+| `diag_trbl`  | top-right → bottom-left                                | `/`    |
+| `unknown`    | round / symmetric / no clear axis, or low confidence   | (none) |
+
+The orientation is:
+
+- constrained via the strict JSON schema in
+  `llm_detect/main.py` (`ORIENTATION_LABELS`);
+- normalized (`_normalize_orientation`) so common LLM aliases like
+  `up-down`, `landscape`, `slash`, `\` all fold onto the 4 canonical
+  labels;
+- rendered on the debug image (`~/.cache/robonix/object_detect/latest_ok.jpg`)
+  as a **magenta stroke inside the bbox** — a different color from the
+  green/yellow target box and the orange other-object boxes;
+- returned to the caller inside the `detect_object` result as
+  `orientation`.
+
+When `rotation_cam2arm` is enabled the image is flipped 180°; since
+these labels describe an unsigned axis, they are invariant under 180°
+rotation and passed through unchanged.
+
+## Standalone local test
+
+`scripts/test_local.py` lets you run the exact same prompt + schema on
+a **single local image**, without ROS or robonix_api, and drops an
+annotated JPEG with the bbox + orientation stroke. Useful for
+prompt-tuning and CI smoke tests.
+
+```bash
+pip install opencv-python openai toml
+python scripts/test_local.py \
+    --image  /path/to/frame.jpg \
+    --object banana \
+    --base-url https://api.openai.com/v1 \
+    --model    gpt-4o \
+    --api-key  sk-... \
+    --output   /tmp/detect_out.jpg \
+    --dump-json /tmp/detect_out.json
+```
+
+Env fallbacks (used when the matching flag is omitted):
+`LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY`, `LLM_TEMPERATURE`.
+
+Exit codes: `0` = target found + annotated, `1` = LLM said not found,
+`2/3/4/5/64/66/70` = various IO / API / dependency errors (see script
+source).
+
 ## License
 
 This package: MulanPSL-2.0.
